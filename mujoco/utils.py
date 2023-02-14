@@ -81,7 +81,7 @@ class ReplayPool:
 def make_gif(policy, env, step_count, state_filter, maxsteps=1000, name=None):
     envname = env.spec.id
     if name is None: gif_name = '_'.join([envname, str(step_count)]);
-    else: gif_name = str(step_count) + name;
+    else: gif_name = name;
     state = env.reset()
     done = False
     steps = []
@@ -103,11 +103,11 @@ def make_gif(policy, env, step_count, state_filter, maxsteps=1000, name=None):
     clip.write_gif('gifs/{}.gif'.format(gif_name), fps=30)
 
 
-def make_checkpoint(agent, step_count: int, env_name: str) -> None:
+def make_checkpoint(agent, step_count: int, env_name: str, filename) -> None:
     q_funcs, target_q_funcs, policy, log_alpha = agent.q_funcs, agent.target_q_funcs, agent.policy, agent.log_alpha
     
-    save_path = "checkpoints/model-{}-{}.pt".format(step_count, env_name)
-
+    save_path = f"./checkpoints/{filename}.pt" #"checkpoints/model-{}-{}.pt".format(step_count, env_name)
+    print('Chkpt: ', os.path.isdir('checkpoints'), os.getcwd())
     if not os.path.isdir('checkpoints'):
         os.makedirs('checkpoints')
 
