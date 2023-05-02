@@ -14,10 +14,12 @@ from top import TOP_Agent
 from utils import MeanStdevFilter, Transition, make_gif, make_checkpoint
 import datetime
 import pandas as pd
+from spsa1 import SPSA
+from collections import deque
 
 GYM_ENV = gym.wrappers.time_limit.TimeLimit
 
-def train_agent_model_free(agent: TOP_Agent, env: GYM_ENV, params: Dict) -> None:
+def train_agent_model_free(agent: TOP_Agent, env: GYM_ENV, params: Dict, spsa) -> None:
     
     update_timestep = params['update_every_n_steps']
     seed = params['seed']
@@ -32,20 +34,18 @@ def train_agent_model_free(agent: TOP_Agent, env: GYM_ENV, params: Dict) -> None
 
     assert n_collect_steps > agent.batchsize, "We must initially collect as many steps as the batch size!"
 
-    avg_length = 0
     time_step = 0
     cumulative_timestep = 0
-    cumulative_log_timestep = 0
     n_updates = 0
-    i_episode = 0
-    log_episode = 0
     samples_number = 0
     episode_rewards = []
-    episode_steps = []
     train_episode_return = []
     eval_episode_return = []
     optimisms = []
     evaluations = []
+    error_buffer = deque(maxlen=5)
+    use_std = True
+    feedback = None
 
     if use_statefilter:
         state_filter = MeanStdevFilter(env.env.observation_space.shape[0])
@@ -63,24 +63,21 @@ def train_agent_model_free(agent: TOP_Agent, env: GYM_ENV, params: Dict) -> None
     #com = f"TOP_{params['env']}_nq{params['n_quantiles']}_{params['bandit_lr']}_seed{seed}"
     writer = SummaryWriter(log_dir='logs/' + filename)
 
-    print('TOP Training begins....')
+    print('Training begins....')
 
     prev_episode_reward = 0
     while samples_number < 1e6:
         time_step = 0
         episode_reward = 0
-        i_episode += 1
-        log_episode += 1
         state = env.reset()
         if state_filter:
             state_filter.update(state)
         done = False
 
-        # sample an optimism setting for this episode
-        optimism = agent.TDC.sample()
+        if (feedback is not None) and (cumulative_timestep >= n_collect_steps):
+            agent.new_episode = True
 
         while (not done):
-            cumulative_log_timestep += 1
             cumulative_timestep += 1
             time_step += 1
             samples_number += 1
@@ -99,7 +96,7 @@ def train_agent_model_free(agent: TOP_Agent, env: GYM_ENV, params: Dict) -> None
             episode_reward += reward
             # update if it's time
             if cumulative_timestep % update_timestep == 0 and cumulative_timestep >= n_collect_steps:
-                q1_loss, q2_loss, pi_loss, avg_wd, q1, q2 = agent.optimize(update_timestep, optimism, state_filter=state_filter)
+                q1_loss, q2_loss, pi_loss, avg_wd, q1, q2 = agent.optimize(update_timestep, feedback, done, time_step, state_filter=state_filter)
                 n_updates += 1
             # logging
             if cumulative_timestep % log_interval == 0 and cumulative_timestep >= n_collect_steps:
@@ -111,14 +108,8 @@ def train_agent_model_free(agent: TOP_Agent, env: GYM_ENV, params: Dict) -> None
                 writer.add_scalar('Distributions/Mean_2', torch.mean(q2), n_updates)
                 writer.add_scalar('Distributions/Median_2', torch.median(q2), n_updates)
 
-                # bandit tracking
-                arm_probs = agent.TDC.get_probs() 
-                for i, p in enumerate(arm_probs):
-                    writer.add_scalar(f'Distributions/arm{i}', p, n_updates)
-
                 if pi_loss:
                     writer.add_scalar('Loss/policy', pi_loss, n_updates)
-                avg_length = np.mean(episode_steps)
                 running_reward = np.mean(episode_rewards)
                 evaluations.append(running_reward)
                 print('Timesteps: ', cumulative_timestep)
@@ -126,29 +117,36 @@ def train_agent_model_free(agent: TOP_Agent, env: GYM_ENV, params: Dict) -> None
                 eval_episode_return.append(eval_reward)
                 writer.add_scalar('Metrics/Train_running_reward', running_reward, cumulative_timestep)
                 writer.add_scalar('Metrics/Eval_return', eval_reward, cumulative_timestep)
-                episode_steps = []
                 episode_rewards = []
-            #if cumulative_timestep % gif_interval == 0:
-            #    make_gif(agent, env, cumulative_timestep, state_filter, name=com)
-            #    if save_model:
-            #        make_checkpoint(agent, cumulative_timestep, params['env'], filename)
-
-        episode_steps.append(time_step)
+        
         episode_rewards.append(episode_reward)
         writer.add_scalar('Metrics/Train_return', episode_reward, cumulative_timestep)
         train_episode_return.append(episode_reward)
 
         # update bandit parameters
-        if 'subfb' in params['fb_type']:
-            feedback = episode_reward - prev_episode_reward
-        elif 'divfb' in params['fb_type']:
-            if prev_episode_reward == 0:
-                feedback = 1
+        if prev_episode_reward == 0:
+            feedback = 1
+            #error_buffer.append(feedback)
+            beta = 0
+        else:
+            feedback = episode_reward/prev_episode_reward
+            feedback -= 1
+            
+            """
+            # normalize
+            error_buffer.append(feedback)
+            feedback -= np.mean(error_buffer)
+            if use_std and len(error_buffer) > 1:
+                norm = np.std(error_buffer)
+                feedback /= norm
+            """
+            if agent.update_begins:
+                beta = agent.optimism.item()
             else:
-                feedback = episode_reward/prev_episode_reward
-                feedback -= 1
-        writer.add_scalar('Metrics/Optimism', optimism, n_updates)
-        agent.TDC.update_dists(feedback)
+                beta = 0
+        
+        optimisms.append(beta)
+        writer.add_scalar('Metrics/Optimism', beta, n_updates)
         prev_episode_reward = episode_reward
 
     s1 = pd.Series(eval_episode_return, name='Eval_ep_return')
@@ -213,11 +211,45 @@ def main():
     # initialize agent
     agent = TOP_Agent(seed, state_dim, action_dim, \
         n_quantiles=params['n_quantiles'], bandit_lr=params['bandit_lr'])
+    spsa = None #SPSA(seed, params['bandit_lr'], params['fb_type'])
 
     # train agent 
-    train_agent_model_free(agent=agent, env=env, params=params)
+    train_agent_model_free(agent=agent, env=env, params=params, spsa=spsa)
     print('Total training time: ', datetime.datetime.now() - start_time)
+
+    # 1a direct fb and non-tanh op
+    # 1b tanh fb and non-tanh op
+    # 1c tanh fb and tanh op
+    # 1d norm fb and non-tanh op
+    # 1e norm fb and tanh op
+    # 1f ewa with 1a
+    # 1g fourier with direct fb and non-tanh op
+    # 1h spsa1 with 0.1 and delayed updates every 50 episodes (beta_0 = 0 -> works)
+    # 1i spsa1 with 0.01 and delayed updates every 50 episodes (beta_0 = 0 -> works)
+    # 1j spsa1 with low lr (5e-3) (beta_0=U[-1, 1] -> noisy)
+    # 1k delayed target nets for beta with multiple batches (didn't work)
+    # 1l delayed target nets for beta with same batch (didn't work)
+    # 1m policy based loss with delayed target nets (didn't work)
+
+    # 1n spsa1 with 0.1 and delayed updates every 100 episodes (beta_0=U[-1, 1])
+    # 1o spsa1 with 0.01 and delayed updates every 100 episodes (beta_0=U[-1, 1])
+    # 1p spsa1 with 0.05 and delayed updates every 100 episodes (beta_0=U[-1, 1])
+    # 1q spsa1 with 0.005 and delayed updates every 100 episodes (beta_0=U[-1, 1])
+
+    # 1r spsa1 with 0.005 and delayed updates every 50 episodes (beta_0=U[-1, 1])
+    # 1s spsa1 with 0.05 and delayed updates every 50 episodes (beta_0=U[-1, 1])
+    # 1t spsa1 with 0.01 and delayed updates every 50 episodes (beta_0=U[-1, 1])
+    # 1u spsa1 with 0.1 and delayed updates every 50 episodes (beta_0=U[-1, 1])
+    # 1v spsa1 with 0.005 and delayed updates every 50 episodes (beta_0=0)
+    # 1w spsa1 with 0.05 and delayed updates every 50 episodes (beta_0=0)
+    # 1x spsa1 with 0.05 and delayed updates every 100 episodes (beta_0=0)
+    # 1y spsa1 with 0.005 and delayed updates every 100 episodes (beta_0=0)
+    # 1z spsa1 with 0.1 and delayed updates every 100 episodes (beta_0 = 0)
+    # 1aa spsa1 with 0.01 and delayed updates every 100 episodes (beta_0 = 0)
+
+
 
 
 if __name__ == '__main__':
     main()
+

@@ -14,10 +14,11 @@ from top import TOP_Agent
 from utils import MeanStdevFilter, Transition, make_gif, make_checkpoint
 import datetime
 import pandas as pd
+from spsa import SPSA1
 
 GYM_ENV = gym.wrappers.time_limit.TimeLimit
 
-def train_agent_model_free(agent: TOP_Agent, env: GYM_ENV, params: Dict) -> None:
+def train_agent_model_free(agent: TOP_Agent, env: GYM_ENV, params: Dict, spsa) -> None:
     
     update_timestep = params['update_every_n_steps']
     seed = params['seed']
@@ -32,20 +33,16 @@ def train_agent_model_free(agent: TOP_Agent, env: GYM_ENV, params: Dict) -> None
 
     assert n_collect_steps > agent.batchsize, "We must initially collect as many steps as the batch size!"
 
-    avg_length = 0
     time_step = 0
     cumulative_timestep = 0
-    cumulative_log_timestep = 0
     n_updates = 0
-    i_episode = 0
-    log_episode = 0
     samples_number = 0
     episode_rewards = []
-    episode_steps = []
     train_episode_return = []
     eval_episode_return = []
     optimisms = []
     evaluations = []
+    ep_num = 0
 
     if use_statefilter:
         state_filter = MeanStdevFilter(env.env.observation_space.shape[0])
@@ -59,28 +56,32 @@ def train_agent_model_free(agent: TOP_Agent, env: GYM_ENV, params: Dict) -> None
     env.action_space.np_random.seed(seed)
 
     max_steps = env.spec.max_episode_steps
-
-    #com = f"TOP_{params['env']}_nq{params['n_quantiles']}_{params['bandit_lr']}_seed{seed}"
     writer = SummaryWriter(log_dir='logs/' + filename)
 
-    print('TOP Training begins....')
+    print('cTOP training begins....')
 
     prev_episode_reward = 0
     while samples_number < 1e6:
         time_step = 0
         episode_reward = 0
-        i_episode += 1
-        log_episode += 1
         state = env.reset()
         if state_filter:
             state_filter.update(state)
         done = False
 
         # sample an optimism setting for this episode
-        optimism = agent.TDC.sample()
+        # SPSA2
+        #if ep_num == 0 or ep_num % 2 == 0:
+        #    optimism_plus, optimism_minus = spsa.sample()
+        #"""
+        #Delayed updates
+        if ep_num == 0:
+            optimism = spsa.sample()
+            optimisms.append(spsa.optimism)
+            writer.add_scalar('Metrics/Optimism', spsa.optimism, ep_num)
+        #"""
 
         while (not done):
-            cumulative_log_timestep += 1
             cumulative_timestep += 1
             time_step += 1
             samples_number += 1
@@ -97,6 +98,13 @@ def train_agent_model_free(agent: TOP_Agent, env: GYM_ENV, params: Dict) -> None
             if state_filter:
                 state_filter.update(state)
             episode_reward += reward
+
+            # SPSA2
+            #if ep_num == 0 or ep_num % 2 == 0:
+            #    optimism = optimism_plus
+            #else:
+            #    optimism = optimism_minus
+
             # update if it's time
             if cumulative_timestep % update_timestep == 0 and cumulative_timestep >= n_collect_steps:
                 q1_loss, q2_loss, pi_loss, avg_wd, q1, q2 = agent.optimize(update_timestep, optimism, state_filter=state_filter)
@@ -111,14 +119,8 @@ def train_agent_model_free(agent: TOP_Agent, env: GYM_ENV, params: Dict) -> None
                 writer.add_scalar('Distributions/Mean_2', torch.mean(q2), n_updates)
                 writer.add_scalar('Distributions/Median_2', torch.median(q2), n_updates)
 
-                # bandit tracking
-                arm_probs = agent.TDC.get_probs() 
-                for i, p in enumerate(arm_probs):
-                    writer.add_scalar(f'Distributions/arm{i}', p, n_updates)
-
                 if pi_loss:
                     writer.add_scalar('Loss/policy', pi_loss, n_updates)
-                avg_length = np.mean(episode_steps)
                 running_reward = np.mean(episode_rewards)
                 evaluations.append(running_reward)
                 print('Timesteps: ', cumulative_timestep)
@@ -126,29 +128,25 @@ def train_agent_model_free(agent: TOP_Agent, env: GYM_ENV, params: Dict) -> None
                 eval_episode_return.append(eval_reward)
                 writer.add_scalar('Metrics/Train_running_reward', running_reward, cumulative_timestep)
                 writer.add_scalar('Metrics/Eval_return', eval_reward, cumulative_timestep)
-                episode_steps = []
                 episode_rewards = []
-            #if cumulative_timestep % gif_interval == 0:
-            #    make_gif(agent, env, cumulative_timestep, state_filter, name=com)
-            #    if save_model:
-            #        make_checkpoint(agent, cumulative_timestep, params['env'], filename)
 
-        episode_steps.append(time_step)
         episode_rewards.append(episode_reward)
         writer.add_scalar('Metrics/Train_return', episode_reward, cumulative_timestep)
         train_episode_return.append(episode_reward)
+        ep_num += 1
 
         # update bandit parameters
-        if 'subfb' in params['fb_type']:
-            feedback = episode_reward - prev_episode_reward
-        elif 'divfb' in params['fb_type']:
-            if prev_episode_reward == 0:
-                feedback = 1
-            else:
-                feedback = episode_reward/prev_episode_reward
-                feedback -= 1
-        writer.add_scalar('Metrics/Optimism', optimism, n_updates)
-        agent.TDC.update_dists(feedback)
+        feedback = episode_reward - prev_episode_reward
+        spsa.append_fb(episode_reward, prev_episode_reward)
+        writer.add_scalar('Metrics/Episode', ep_num, ep_num)
+        
+        #Delayed updates
+        #if ((ep_num % 50) == 0) or (samples_number == int(1e6)):
+        spsa.update()
+        optimisms.append(spsa.optimism)
+        writer.add_scalar('Metrics/Optimism', spsa.optimism, cumulative_timestep)
+        optimism = spsa.sample()
+        
         prev_episode_reward = episode_reward
 
     s1 = pd.Series(eval_episode_return, name='Eval_ep_return')
@@ -176,7 +174,7 @@ def evaluate_agent(
             state = nextstate
 
     print("---------------------------------------")
-    print(f"Eval Return: {reward_sum:.3f}")
+    print(f"Eval Return: {reward_sum / n_starts:.3f} over {n_starts} episodes")
     print("---------------------------------------")
     return reward_sum / n_starts
 
@@ -190,7 +188,7 @@ def main():
     parser.add_argument('--update_every_n_steps', type=int, default=1)
     parser.add_argument('--n_random_actions', type=int, default=25000)
     parser.add_argument('--n_collect_steps', type=int, default=1000)
-    parser.add_argument('--n_evals', type=int, default=1)
+    parser.add_argument('--n_evals', type=int, default=10)
     parser.add_argument('--save_model', dest='save_model', action='store_true')
     parser.add_argument('--n_quantiles', type=int, default=50)
     parser.add_argument('--bandit_lr', type=float, default=0.1)
@@ -213,9 +211,10 @@ def main():
     # initialize agent
     agent = TOP_Agent(seed, state_dim, action_dim, \
         n_quantiles=params['n_quantiles'], bandit_lr=params['bandit_lr'])
+    spsa = SPSA1(seed, params['bandit_lr'], params['fb_type'])
 
     # train agent 
-    train_agent_model_free(agent=agent, env=env, params=params)
+    train_agent_model_free(agent=agent, env=env, params=params, spsa=spsa)
     print('Total training time: ', datetime.datetime.now() - start_time)
 
 
